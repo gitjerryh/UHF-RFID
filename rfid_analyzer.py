@@ -9,6 +9,8 @@ from typing import List, Dict, Optional
 import os
 import serial
 import re
+import cv2
+from picamera2 import Picamera2
 
 # 配置日志
 logging.basicConfig(
@@ -39,17 +41,27 @@ class RFIDAnalyzer:
         self.distance_threshold = 1.0  # 距离变化阈值(米) - 放宽到1米
         self.rssi_std_threshold = 8.0  # RSSI标准差阈值 - 放宽到8
         self.min_samples = 3  # 最小样本数 - 减少到3个
-        self.unreliable_count_threshold = 5  # 连续不可靠次数阈值 - 增加到5次
         self.vision_mode_duration = 10  # 视觉模式持续时间(秒)
         
         # 数据存储
         self.tag_history: Dict[str, List[TagData]] = {}
-        self.unreliable_count: Dict[str, int] = {}
         self.reliability_reasons: Dict[str, List[str]] = {}
         
         # 状态
         self.current_mode = "RFID"  # RFID或VISION
         self.last_switch_time = time.time()
+        
+        # ArUco相关
+        self.aruco_initialized = False
+        self.aruco_markers_detected = False
+        self.picam2 = None
+        self.marker_size = 0.05  # ArUco标记的边长，单位：米
+        self.camera_matrix = np.array([
+            [1000, 0, 640],
+            [0, 1000, 360],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
         
     def add_data(self, data: dict) -> bool:
         """添加新的标签数据并分析可靠性"""
@@ -67,7 +79,6 @@ class RFIDAnalyzer:
             # 更新标签历史
             if tag_data.id not in self.tag_history:
                 self.tag_history[tag_data.id] = []
-                self.unreliable_count[tag_data.id] = 0
                 self.reliability_reasons[tag_data.id] = []
             
             self.tag_history[tag_data.id].append(tag_data)
@@ -80,14 +91,8 @@ class RFIDAnalyzer:
             is_reliable, reasons = self._analyze_reliability(tag_data)
             self.reliability_reasons[tag_data.id] = reasons
             
-            # 更新不可靠计数
-            if not is_reliable:
-                self.unreliable_count[tag_data.id] += 1
-            else:
-                self.unreliable_count[tag_data.id] = 0
-            
-            # 检查是否需要切换到视觉模式
-            if self._should_switch_to_vision(tag_data.id):
+            # 如果数据不可靠，立即切换到视觉模式
+            if not is_reliable and self.current_mode != "VISION":
                 self._switch_to_vision_mode(tag_data)
             
             # 检查是否需要从视觉模式返回RFID模式
@@ -134,25 +139,160 @@ class RFIDAnalyzer:
         
         return True, ["数据可靠"]
     
-    def _should_switch_to_vision(self, tag_id: str) -> bool:
-        """判断是否需要切换到视觉模式"""
-        return (self.unreliable_count[tag_id] >= self.unreliable_count_threshold and 
-                self.current_mode != "VISION")
-    
     def _switch_to_vision_mode(self, tag_data: TagData):
         """切换到视觉定位模式"""
         if self.current_mode != "VISION":
             self.current_mode = "VISION"
             self.last_switch_time = time.time()
             logging.info(f"切换到视觉模式 - 标签: {tag_data.id}")
-            # TODO: 在这里添加调用摄像头的代码
+            
+            # 初始化ArUco检测，检查初始化结果
+            if not self._initialize_aruco_detection():
+                logging.error("视觉模式初始化失败，返回RFID模式")
+                self.current_mode = "RFID"
+                return
+            
+            # 启动ArUco检测
+            self.aruco_markers_detected = False
+            self._run_aruco_detection()
+    
+    def _initialize_aruco_detection(self):
+        """初始化ArUco标记检测"""
+        try:
+            # 确保先释放摄像头资源
+            if self.picam2 is not None:
+                try:
+                    self.picam2.stop()
+                    self.picam2.close()
+                except:
+                    pass
+                self.picam2 = None
+                self.aruco_initialized = False
+                time.sleep(1)  # 等待资源完全释放
+            
+            # 检查是否有摄像头连接
+            cameras = Picamera2.global_camera_info()
+            if not cameras:
+                logging.error("未检测到摄像头，请检查连接")
+                return False
+                
+            # 重新初始化摄像头
+            self.picam2 = Picamera2()
+            config = self.picam2.create_preview_configuration(main={"size": (1280, 720), "format": "RGB888"})
+            self.picam2.configure(config)
+            
+            # 设置较长的初始化时间，提高稳定性
+            self.picam2.start(show_preview=False)
+            time.sleep(3)  # 增加等待时间
+            
+            # 测试摄像头是否工作正常
+            try:
+                test_frame = self.picam2.capture_array()
+                if test_frame is None or test_frame.size == 0:
+                    logging.error("摄像头初始化失败，未能获取图像")
+                    self.picam2.stop()
+                    self.picam2.close()
+                    self.picam2 = None
+                    return False
+            except Exception as e:
+                logging.error(f"摄像头测试失败: {e}")
+                self.picam2.stop()
+                self.picam2.close()
+                self.picam2 = None
+                return False
+                
+            self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+            self.aruco_params = cv2.aruco.DetectorParameters_create()
+            
+            logging.info("ArUco检测初始化成功")
+            self.aruco_initialized = True
+            return True
+        except Exception as e:
+            logging.error(f"ArUco检测初始化失败: {e}")
+            if self.picam2 is not None:
+                try:
+                    self.picam2.stop()
+                    self.picam2.close()
+                except:
+                    pass
+                self.picam2 = None
+            return False
+    
+    def _run_aruco_detection(self):
+        """运行ArUco标记检测"""
+        if not self.aruco_initialized:
+            logging.error("ArUco检测未初始化")
+            return
+        
+        try:
+            logging.info("开始检测ArUco标记...")
+            
+            # 进行10次标记检测尝试
+            for _ in range(10):
+                # 捕获图像
+                frame = self.picam2.capture_array()
+                
+                # 转换为灰度图
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                
+                # 检测标记
+                corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+                
+                if ids is not None and len(ids) >= 2:
+                    # 估计标记的姿态
+                    rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                        corners, self.marker_size, self.camera_matrix, self.dist_coeffs)
+                    
+                    # 计算两个标记之间的距离
+                    if len(tvecs) >= 2:
+                        # 获取两个标记的位置向量
+                        pos1 = tvecs[0][0]
+                        pos2 = tvecs[1][0]
+                        
+                        # 计算欧几里得距离
+                        distance = np.linalg.norm(pos1 - pos2)
+                        
+                        logging.info(f"检测到 {len(ids)} 个ArUco标记:")
+                        for i, marker_id in enumerate(ids):
+                            logging.info(f"  - 标记 ID: {marker_id[0]}, 位置: {tvecs[i][0]}")
+                        logging.info(f"  标记之间的距离: {distance:.3f} 米")
+                        
+                        # 设置标记已检测标志
+                        self.aruco_markers_detected = True
+                        # 检测成功后切换回RFID模式
+                        self.current_mode = "RFID"
+                        logging.info("ArUco标记检测成功，从视觉模式返回RFID模式")
+                        break
+                else:
+                    logging.info("未检测到足够的ArUco标记（需要至少2个标记）")
+                
+                time.sleep(0.5)  # 降低检测频率
+                
+            if not self.aruco_markers_detected:
+                logging.warning("未能成功检测到足够的ArUco标记，继续视觉模式")
+                
+        except Exception as e:
+            logging.error(f"ArUco检测错误: {e}")
+        finally:
+            # 如果摄像头已初始化但未成功检测到标记，保持视觉模式
+            pass
     
     def _check_vision_mode_timeout(self):
         """检查是否需要从视觉模式返回RFID模式"""
+        # 只有在以下情况才会超时返回RFID模式：
+        # 1. 当前是视觉模式
+        # 2. 超过了设置的超时时间
+        # 3. 未成功检测到标记
         if (self.current_mode == "VISION" and 
-            time.time() - self.last_switch_time > self.vision_mode_duration):
+            time.time() - self.last_switch_time > self.vision_mode_duration and
+            not self.aruco_markers_detected):
             self.current_mode = "RFID"
-            logging.info(f"从视觉模式返回RFID模式")
+            logging.info(f"视觉模式超时，返回RFID模式")
+            
+            # 关闭摄像头
+            if self.picam2 is not None:
+                self.picam2.stop()
+                self.aruco_initialized = False
     
     def get_tag_statistics(self, tag_id: str) -> Optional[dict]:
         """获取标签的统计信息"""
@@ -174,8 +314,8 @@ class RFIDAnalyzer:
             "distance_std": np.std(distances),
             "sample_count": len(history),
             "last_update": datetime.fromtimestamp(history[-1].timestamp/1000).strftime('%Y-%m-%d %H:%M:%S') if history[-1].timestamp > 0 else "未知",
-            "is_reliable": self.unreliable_count[tag_id] == 0,
-            "reliability_status": "可靠" if self.unreliable_count[tag_id] == 0 else "不可靠",
+            "is_reliable": len(self.reliability_reasons[tag_id]) == 0 or self.reliability_reasons[tag_id][0] == "数据可靠",
+            "reliability_status": "可靠" if (len(self.reliability_reasons[tag_id]) == 0 or self.reliability_reasons[tag_id][0] == "数据可靠") else "不可靠",
             "reasons": self.reliability_reasons[tag_id] if tag_id in self.reliability_reasons else []
         }
 
@@ -257,6 +397,8 @@ def main():
                 
         except KeyboardInterrupt:
             print("\n程序已停止")
+            if analyzer.picam2 is not None:
+                analyzer.picam2.stop()
             break
         except Exception as e:
             logging.error(f"错误: {e}")
